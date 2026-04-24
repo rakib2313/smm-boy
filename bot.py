@@ -2,16 +2,20 @@
 import os
 import logging
 import asyncio
+import threading
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler, ContextTypes, TypeHandler
+from telegram.error import Conflict
 import aiosqlite
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ========= কনফিগারেশন (এনভায়রনমেন্ট ভেরিয়েবল থেকে) =========
+# ========= কনফিগারেশন =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "demo_chanel12")
 CHANNEL_INVITE_LINK = f"https://t.me/{CHANNEL_USERNAME}"
+IS_RENDER = os.getenv("RENDER") == "true"  # Render automatically sets this
 
 PRICES = {
     "tiktok_likes":    {"min": 100, "price": 0.02, "unit": "like"},
@@ -32,6 +36,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 DB_PATH = "smm_bot.db"
 
+# ডামি HTTP সার্ভার (শুধু Render-এর জন্য পোর্ট খোলা রাখতে)
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, format, *args):
+        pass
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
+
+# ডাটাবেস ফাংশন (আগের মতো)
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, balance REAL DEFAULT 0, joined_channel INTEGER DEFAULT 0, join_date TEXT)''')
@@ -70,7 +89,7 @@ async def is_user_member(user_id, context):
         logger.error(f"membership check error: {e}")
         return False
 
-# =============== রিপ্লাই কিবোর্ড মেনু (নিচের দিকে থাকবে) ===============
+# কীবোর্ড
 def main_menu_keyboard():
     buttons = [
         [KeyboardButton("💰 Balance"), KeyboardButton("👤 Profile")],
@@ -80,49 +99,42 @@ def main_menu_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
-# =============== হ্যান্ডলার ===============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# হ্যান্ডলার (আগের মতোই, সংক্ষেপে লিখছি)
+async def start(update, context):
     user = update.effective_user
     await create_user(user.id, user.username, user.full_name)
     db_user = await get_user(user.id)
     if db_user and db_user["joined_channel"]:
-        await update.message.reply_text(f"স্বাগতম {user.first_name}! নিচের মেনু ব্যবহার করুন:", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(f"স্বাগতম {user.first_name}!", reply_markup=main_menu_keyboard())
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 চ্যানেল জয়েন করুন", url=CHANNEL_INVITE_LINK)],
         [InlineKeyboardButton("✅ ভেরিফাই করুন", callback_data="verify_join")]
     ])
-    await update.message.reply_text(f"🚫 অ্যাক্সেস denied!\n\nচ্যানেল জয়েন করুন: {CHANNEL_INVITE_LINK}\nজয়েন করে ভেরিফাই বাটন চাপুন।", reply_markup=kb)
+    await update.message.reply_text(f"🚫 অ্যাক্সেস denied!\n\nচ্যানেল জয়েন করুন: {CHANNEL_INVITE_LINK}", reply_markup=kb)
 
-async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify(update, context):
     q = update.callback_query
     await q.answer()
     if await is_user_member(q.from_user.id, context):
         await set_joined(q.from_user.id, True)
-        await q.edit_message_text("✅ ভেরিফিকেশন সফল! নিচের মেনু ব্যবহার করুন:", reply_markup=main_menu_keyboard())
+        await q.edit_message_text("✅ ভেরিফিকেশন সফল!", reply_markup=main_menu_keyboard())
     else:
-        await q.edit_message_text(f"❌ আপনি এখনো চ্যানেল জয়েন করেননি। লিংক: {CHANNEL_INVITE_LINK}", reply_markup=q.message.reply_markup)
+        await q.edit_message_text(f"❌ জয়েন করেননি: {CHANNEL_INVITE_LINK}", reply_markup=q.message.reply_markup)
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def balance_command(update, context):
+    user = await get_user(update.effective_user.id)
+    await update.message.reply_text(f"💰 ব্যালেন্স: {user['balance']:.2f} TK" if user else "ত্রুটি", reply_markup=main_menu_keyboard())
+async def profile_command(update, context):
     user = await get_user(update.effective_user.id)
     if user:
-        await update.message.reply_text(f"💰 আপনার ব্যালেন্স: {user['balance']:.2f} TK", reply_markup=main_menu_keyboard())
-    else:
-        await update.message.reply_text("ত্রুটি!", reply_markup=main_menu_keyboard())
-
-async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = await get_user(update.effective_user.id)
-    if user:
-        txt = f"👤 প্রোফাইল\n🆔 আইডি: `{user['user_id']}`\nনাম: {user['full_name']}\nব্যালেন্স: {user['balance']:.2f} TK\n✅ চ্যানেল ভেরিফাই: {'হ্যাঁ' if user['joined_channel'] else 'না'}"
+        txt = f"👤 প্রোফাইল\n🆔 {user['user_id']}\nনাম: {user['full_name']}\nব্যালেন্স: {user['balance']:.2f} TK\n✅ ভেরিফাই: {'হ্যাঁ' if user['joined_channel'] else 'না'}"
         await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     else:
-        await update.message.reply_text("ত্রুটি!", reply_markup=main_menu_keyboard())
-
-async def add_money_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = "💸 টাকা যোগ করতে অ্যাডমিনের সাথে যোগাযোগ করুন। অ্যাডমিন কমান্ড: `/addmoney <user_id> <amount>`\nউদাহরণ: `/addmoney 6792180455 100`"
-    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-async def admin_add_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("ত্রুটি", reply_markup=main_menu_keyboard())
+async def add_money_info_command(update, context):
+    await update.message.reply_text("💸 টাকা যোগ করতে অ্যাডমিন /addmoney ব্যবহার করুন।", reply_markup=main_menu_keyboard())
+async def admin_add_money(update, context):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("অনুমতি নেই")
         return
@@ -130,102 +142,58 @@ async def admin_add_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(context.args[0]); amt = float(context.args[1])
         nb = await update_balance(uid, amt)
         await update.message.reply_text(f"✅ {amt} TK যোগ হয়েছে {uid} নং ইউজারে। নতুন ব্যালেন্স: {nb:.2f} TK")
-        try:
-            await context.bot.send_message(uid, f"আপনার অ্যাকাউন্টে {amt} TK যোগ হয়েছে। ব্যালেন্স: {nb:.2f} TK")
+        try: await context.bot.send_message(uid, f"আপনার অ্যাকাউন্টে {amt} TK যোগ হয়েছে। ব্যালেন্স: {nb:.2f} TK")
         except: pass
-    except:
-        await update.message.reply_text("সঠিক ব্যবহার: /addmoney user_id amount")
-
-async def menu_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❤️ Buy Likes", callback_data="buy_tiktok_likes"), InlineKeyboardButton("👁️ Buy Views", callback_data="buy_tiktok_views")],
-        [InlineKeyboardButton("🔁 Buy Shares", callback_data="buy_tiktok_shares")],
-        [InlineKeyboardButton("◀️ Back to Main", callback_data="main_menu")]
-    ])
-    await update.message.reply_text("📱 টিকটক সেবা বেছে নিন:", reply_markup=kb)
-
-async def menu_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Buy Subscribers", callback_data="buy_youtube_subs"), InlineKeyboardButton("👁️ Buy Views", callback_data="buy_youtube_views")],
-        [InlineKeyboardButton("👍 Buy Likes", callback_data="buy_youtube_likes")],
-        [InlineKeyboardButton("◀️ Back to Main", callback_data="main_menu")]
-    ])
-    await update.message.reply_text("▶️ ইউটিউব সেবা বেছে নিন:", reply_markup=kb)
-
-async def menu_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Buy Followers", callback_data="buy_instagram_followers"), InlineKeyboardButton("❤️ Buy Likes", callback_data="buy_instagram_likes")],
-        [InlineKeyboardButton("👁️ Buy Views", callback_data="buy_instagram_views")],
-        [InlineKeyboardButton("◀️ Back to Main", callback_data="main_menu")]
-    ])
-    await update.message.reply_text("📸 ইনস্টাগ্রাম সেবা বেছে নিন:", reply_markup=kb)
-
-async def menu_facebook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👍 Buy Followers", callback_data="buy_facebook_followers"), InlineKeyboardButton("😊 Buy Reacts", callback_data="buy_facebook_reacts")],
-        [InlineKeyboardButton("◀️ Back to Main", callback_data="main_menu")]
-    ])
-    await update.message.reply_text("📘 ফেসবুক সেবা বেছে নিন:", reply_markup=kb)
-
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    except: await update.message.reply_text("/addmoney user_id amount")
+async def menu_tiktok(update, context):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❤️ Likes", callback_data="buy_tiktok_likes"), InlineKeyboardButton("👁️ Views", callback_data="buy_tiktok_views")],[InlineKeyboardButton("🔁 Shares", callback_data="buy_tiktok_shares")],[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]])
+    await update.message.reply_text("📱 টিকটক সেবা:", reply_markup=kb)
+async def menu_youtube(update, context):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Subscribers", callback_data="buy_youtube_subs"), InlineKeyboardButton("👁️ Views", callback_data="buy_youtube_views")],[InlineKeyboardButton("👍 Likes", callback_data="buy_youtube_likes")],[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]])
+    await update.message.reply_text("▶️ ইউটিউব সেবা:", reply_markup=kb)
+async def menu_instagram(update, context):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👥 Followers", callback_data="buy_instagram_followers"), InlineKeyboardButton("❤️ Likes", callback_data="buy_instagram_likes")],[InlineKeyboardButton("👁️ Views", callback_data="buy_instagram_views")],[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]])
+    await update.message.reply_text("📸 ইনস্টাগ্রাম সেবা:", reply_markup=kb)
+async def menu_facebook(update, context):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👍 Followers", callback_data="buy_facebook_followers"), InlineKeyboardButton("😊 Reacts", callback_data="buy_facebook_reacts")],[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]])
+    await update.message.reply_text("📘 ফেসবুক সেবা:", reply_markup=kb)
+async def back_to_main(update, context):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("মূল মেনু:", reply_markup=main_menu_keyboard())
+    await query.message.reply_text("মূল মেনু", reply_markup=main_menu_keyboard())
     await query.message.delete()
 
-# ক্রয় কনভারসেশন (ইনলাইন কিবোর্ডের জন্য থাকছে)
-async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['product'] = query.data
-    await query.edit_message_text("📎 লিংক পাঠান (যে পোস্ট/ভিডিওতে এনগেজমেন্ট চান):\nবাতিল করতে /cancel লিখুন।")
-    return GET_LINK
-async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ক্রয় কনভারসেশন (আগের মতো, সংক্ষেপে)
+async def start_purchase(update, context):
+    q = update.callback_query; await q.answer()
+    context.user_data['product'] = q.data
+    await q.edit_message_text("লিংক পাঠান:"); return GET_LINK
+async def get_link(update, context):
     context.user_data['link'] = update.message.text
     prod = context.user_data['product'].replace("buy_", "")
     info = PRICES.get(prod)
-    if not info:
-        await update.message.reply_text("ত্রুটি, মেনু থেকে শুরু করুন", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
+    if not info: await update.message.reply_text("ত্রুটি"); return ConversationHandler.END
     context.user_data['price_info'] = info
-    await update.message.reply_text(f"🔢 সংখ্যা দিন (ন্যূনতম {info['min']} {info['unit']}, প্রতি ইউনিট {info['price']} TK):")
-    return GET_QUANTITY
-async def get_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"সংখ্যা দিন (ন্যূনতম {info['min']}):"); return GET_QUANTITY
+async def get_quantity(update, context):
     try:
-        qty = int(update.message.text)
-        info = context.user_data['price_info']
-        if qty < info['min']:
-            await update.message.reply_text(f"ন্যূনতম {info['min']} দিন। আবার সংখ্যা দিন:")
-            return GET_QUANTITY
-        cost = qty * info['price']
-        context.user_data['qty'] = qty
-        context.user_data['cost'] = cost
+        qty = int(update.message.text); info = context.user_data['price_info']
+        if qty < info['min']: await update.message.reply_text(f"ন্যূনতম {info['min']} দিন"); return GET_QUANTITY
+        cost = qty * info['price']; context.user_data['qty'] = qty; context.user_data['cost'] = cost
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ হ্যাঁ", callback_data="confirm_yes"), InlineKeyboardButton("❌ না", callback_data="confirm_no")]])
-        await update.message.reply_text(f"📝 অর্ডার: {qty} {info['unit']}\n💸 মোট খরচ: {cost:.2f} TK\nনিশ্চিত?", reply_markup=kb)
-        return CONFIRM
-    except:
-        await update.message.reply_text("শুধু সংখ্যা দিন (যেমন 100):")
-        return GET_QUANTITY
-async def confirm_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "confirm_no":
-        await query.edit_message_text("❌ অর্ডার বাতিল করা হয়েছে।", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-    user_id = query.from_user.id
-    user = await get_user(user_id)
-    cost = context.user_data['cost']
-    if user['balance'] < cost:
-        await query.edit_message_text("❌ পর্যাপ্ত ব্যালেন্স নেই। টাকা যোগ করুন।", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
+        await update.message.reply_text(f"অর্ডার: {qty} {info['unit']}\nমোট: {cost:.2f} TK\nনিশ্চিত?", reply_markup=kb); return CONFIRM
+    except: await update.message.reply_text("শুধু সংখ্যা দিন"); return GET_QUANTITY
+async def confirm_purchase(update, context):
+    q = update.callback_query; await q.answer()
+    if q.data == "confirm_no": await q.edit_message_text("বাতিল", reply_markup=main_menu_keyboard()); return ConversationHandler.END
+    user_id = q.from_user.id; user = await get_user(user_id); cost = context.user_data['cost']
+    if user['balance'] < cost: await q.edit_message_text("ব্যালেন্স কম"); return ConversationHandler.END
     nb = await update_balance(user_id, -cost)
     await add_order(user_id, context.user_data['product'].replace("buy_",""), context.user_data['link'], context.user_data['qty'], cost)
-    await query.edit_message_text(f"✅ ক্রয় সফল!\nখরচ: {cost:.2f} TK\nঅবশিষ্ট ব্যালেন্স: {nb:.2f} TK", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 ক্রয় বাতিল।", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
+    await q.edit_message_text(f"✅ ক্রয় সফল! খরচ: {cost:.2f} TK, বাকি: {nb:.2f} TK", reply_markup=main_menu_keyboard()); return ConversationHandler.END
+async def cancel(update, context): await update.message.reply_text("বাতিল", reply_markup=main_menu_keyboard()); return ConversationHandler.END
 
+# মেইন ফাংশন
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise Exception("BOT_TOKEN, ADMIN_ID environment variables required")
@@ -235,8 +203,6 @@ def main():
     app.add_handler(CommandHandler("addmoney", admin_add_money))
     app.add_handler(CallbackQueryHandler(verify, pattern="^verify_join$"))
     app.add_handler(CallbackQueryHandler(back_to_main, pattern="^main_menu$"))
-    
-    # রিপ্লাই কিবোর্ডের বাটন হ্যান্ডলার
     app.add_handler(MessageHandler(filters.Regex('^💰 Balance$'), balance_command))
     app.add_handler(MessageHandler(filters.Regex('^👤 Profile$'), profile_command))
     app.add_handler(MessageHandler(filters.Regex('^➕ Add Money$'), add_money_info_command))
@@ -244,18 +210,21 @@ def main():
     app.add_handler(MessageHandler(filters.Regex('^▶️ YouTube$'), menu_youtube))
     app.add_handler(MessageHandler(filters.Regex('^📘 Facebook$'), menu_facebook))
     app.add_handler(MessageHandler(filters.Regex('^📸 Instagram$'), menu_instagram))
-    
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_purchase, pattern="^buy_")],
-        states={
-            GET_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_link)],
-            GET_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
-            CONFIRM: [CallbackQueryHandler(confirm_purchase, pattern="^(confirm_yes|confirm_no)$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
+    conv = ConversationHandler(entry_points=[CallbackQueryHandler(start_purchase, pattern="^buy_")], states={GET_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_link)], GET_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)], CONFIRM: [CallbackQueryHandler(confirm_purchase, pattern="^(confirm_yes|confirm_no)$")]}, fallbacks=[CommandHandler("cancel", cancel)])
     app.add_handler(conv)
-    print("✅ বট চালু হয়েছে। মেনু নিচের দিকে ReplyKeyboard আকারে দেখা যাবে।")
+
+    # ডামি HTTP সার্ভার চালু (শুধু Render-এর জন্য)
+    if IS_RENDER:
+        threading.Thread(target=run_dummy_server, daemon=True).start()
+        print("Dummy HTTP server started on port", os.environ.get("PORT", 10000))
+        # Webhook সেট করতে চাইলে নিচের অংশ আনকমেন্ট করুন এবং আপনার Render URL দিন
+        # webhook_url = "https://smm-boy.onrender.com"
+        # asyncio.run(app.bot.set_webhook(webhook_url))
+        # app.run_webhook(listen="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+        # কিন্তু সহজ উপায়: Polling চালাবেন, কিন্তু ডামি সার্ভার থাকায় Render খুশি থাকবে
+        print("Starting polling (with dummy HTTP server to satisfy Render)...")
+    else:
+        print("Starting polling on Termux...")
     app.run_polling()
 
 if __name__ == "__main__":
